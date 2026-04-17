@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -15,11 +17,21 @@ import (
 )
 
 type Transaction struct {
-	Symbol string
-	Price  float64
-	Qty    float64
-	Date   time.Time
+	Symbol string    `json:"symbol"`
+	Price  float64   `json:"price"`
+	Qty    float64   `json:"qty"`
+	Date   time.Time `json:"date"`
 }
+
+type parseResponse struct {
+	Transactions []Transaction `json:"transactions"`
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+const maxPDFUploadSize = 20 << 20 // 20 MB
 
 var (
 	dateRe  = regexp.MustCompile(`^\d{2}-[A-Za-z]{3}-\d{4}$`)
@@ -27,33 +39,72 @@ var (
 )
 
 func main() {
-	pdfPath := flag.String("pdf", "", "path to CAS PDF file")
-	password := flag.String("password", "", "PDF password")
-	flag.Parse()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/api/parse-cas", parseCASHandler)
 
-	if *pdfPath == "" || *password == "" {
-		fmt.Fprintln(os.Stderr, "usage: go run . -pdf /path/to/cas.pdf -password 'Linux11!'")
-		os.Exit(2)
-	}
-
-	txs, err := ParseCASTransactions(*pdfPath, *password)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse failed: %v\n", err)
+	addr := ":" + envOrDefault("PORT", "8080")
+	fmt.Printf("listening on %s\n", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		fmt.Fprintf(os.Stderr, "server failed: %v\n", err)
 		os.Exit(1)
-	}
-
-	for _, tx := range txs {
-		fmt.Printf("- %s, %s, %s, %s\n",
-			tx.Symbol,
-			formatFloat(tx.Price, 3, 4),
-			formatFloat(tx.Qty, 3, 3),
-			strings.ToLower(tx.Date.Format("02-Jan-2006")),
-		)
 	}
 }
 
-func ParseCASTransactions(pdfPath, password string) ([]Transaction, error) {
-	text, err := extractPlainText(pdfPath, password)
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func parseCASHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxPDFUploadSize)
+	if err := r.ParseMultipartForm(maxPDFUploadSize); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid multipart form or file too large"})
+		return
+	}
+
+	password := strings.TrimSpace(r.FormValue("password"))
+	if password == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing required field: password"})
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing required file field: file"})
+		return
+	}
+	defer file.Close()
+
+	pdfData, err := io.ReadAll(file)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "failed to read uploaded file"})
+		return
+	}
+	if len(pdfData) == 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "uploaded file is empty"})
+		return
+	}
+
+	transactions, err := ParseCASTransactions(pdfData, password)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, parseResponse{Transactions: transactions})
+}
+
+func ParseCASTransactions(pdfBytes []byte, password string) ([]Transaction, error) {
+	text, err := extractPlainText(pdfBytes, password)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +131,6 @@ func ParseCASTransactions(pdfPath, password string) ([]Transaction, error) {
 		if currentISIN == "" || !dateRe.MatchString(line) {
 			continue
 		}
-
 		if i+4 >= len(lines) {
 			continue
 		}
@@ -120,24 +170,13 @@ func ParseCASTransactions(pdfPath, password string) ([]Transaction, error) {
 	if len(txs) == 0 {
 		return nil, errors.New("no transactions parsed")
 	}
-
 	return txs, nil
 }
 
-func extractPlainText(pdfPath, password string) (string, error) {
-	f, err := os.Open(pdfPath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	st, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-
+func extractPlainText(pdfBytes []byte, password string) (string, error) {
+	reader := bytes.NewReader(pdfBytes)
 	pwProvided := false
-	reader, err := pdf.NewReaderEncrypted(f, st.Size(), func() string {
+	pdfReader, err := pdf.NewReaderEncrypted(reader, int64(len(pdfBytes)), func() string {
 		if pwProvided {
 			return ""
 		}
@@ -148,7 +187,7 @@ func extractPlainText(pdfPath, password string) (string, error) {
 		return "", err
 	}
 
-	plainReader, err := reader.GetPlainText()
+	plainReader, err := pdfReader.GetPlainText()
 	if err != nil {
 		return "", err
 	}
@@ -210,32 +249,26 @@ func parseNumber(s string) (float64, bool) {
 	return v, true
 }
 
-func cleanLine(s string) string {
-	return strings.TrimSpace(s)
-}
-
 func splitLines(s string) []string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	return strings.Split(s, "\n")
 }
 
-func formatFloat(v float64, minDecimals, maxDecimals int) string {
-	s := strconv.FormatFloat(v, 'f', maxDecimals, 64)
-	s = strings.TrimRight(s, "0")
-	s = strings.TrimRight(s, ".")
+func cleanLine(s string) string {
+	return strings.TrimSpace(s)
+}
 
-	dot := strings.IndexByte(s, '.')
-	if dot < 0 {
-		if minDecimals > 0 {
-			return s + "." + strings.Repeat("0", minDecimals)
-		}
-		return s
+func envOrDefault(key, fallback string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
 	}
+	return v
+}
 
-	decimals := len(s) - dot - 1
-	if decimals < minDecimals {
-		s += strings.Repeat("0", minDecimals-decimals)
-	}
-	return s
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
