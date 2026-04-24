@@ -104,7 +104,22 @@ func parseCASHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := writeTransactions(account, parseResponse{Transactions: transactions}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, parseResponse{Transactions: transactions})
+}
+
+func writeTransactions(account string, txns parseResponse) error {
+	data, err := json.Marshal(txns)
+	if err != nil {
+		return err
+	}
+
+	filename := fmt.Sprintf("transactions.%s.json", account)
+	return os.WriteFile(filename, data, 0644)
 }
 
 func ParseCASTransactions(account string, pdfBytes []byte, password string) ([]Transaction, error) {
