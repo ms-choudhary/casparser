@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -17,10 +18,11 @@ import (
 )
 
 type Transaction struct {
-	Symbol string    `json:"symbol"`
-	Price  float64   `json:"price"`
-	Qty    float64   `json:"qty"`
-	Date   time.Time `json:"date"`
+	Account string    `json:"account"`
+	Symbol  string    `json:"symbol"`
+	Price   float64   `json:"price"`
+	Qty     float64   `json:"qty"`
+	Date    time.Time `json:"date"`
 }
 
 type parseResponse struct {
@@ -77,11 +79,13 @@ func parseCASHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing required file field: file"})
 		return
 	}
+
+	account := strings.Split(header.Filename, "_")[0]
 	defer file.Close()
 
 	pdfData, err := io.ReadAll(file)
@@ -94,7 +98,7 @@ func parseCASHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	transactions, err := ParseCASTransactions(pdfData, password)
+	transactions, err := ParseCASTransactions(account, pdfData, password)
 	if err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, errorResponse{Error: err.Error()})
 		return
@@ -103,13 +107,14 @@ func parseCASHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, parseResponse{Transactions: transactions})
 }
 
-func ParseCASTransactions(pdfBytes []byte, password string) ([]Transaction, error) {
+func ParseCASTransactions(account string, pdfBytes []byte, password string) ([]Transaction, error) {
 	text, err := extractPlainText(pdfBytes, password)
 	if err != nil {
 		return nil, err
 	}
 
 	lines := splitLines(text)
+
 	txs := make([]Transaction, 0, 8)
 	currentISIN := ""
 
@@ -147,7 +152,12 @@ func ParseCASTransactions(pdfBytes []byte, password string) ([]Transaction, erro
 		if strings.Contains(descLower, "stamp duty") {
 			continue
 		}
-		if !strings.Contains(descLower, "purchase") && !strings.Contains(descLower, "investment") {
+
+		if strings.Contains(descLower, "redemption") {
+			qty = -math.Abs(qty)
+		}
+
+		if !strings.Contains(descLower, "purchase") && !strings.Contains(descLower, "investment") && !strings.Contains(descLower, "redemption") {
 			continue
 		}
 
@@ -158,10 +168,11 @@ func ParseCASTransactions(pdfBytes []byte, password string) ([]Transaction, erro
 
 		_ = amount // kept for optional reconciliation/debug.
 		txs = append(txs, Transaction{
-			Symbol: currentISIN,
-			Price:  price,
-			Qty:    qty,
-			Date:   date,
+			Account: account,
+			Symbol:  currentISIN,
+			Price:   price,
+			Qty:     qty,
+			Date:    date,
 		})
 
 		i += 4
@@ -240,6 +251,9 @@ func parseNumber(s string) (float64, bool) {
 	s = cleanLine(s)
 	if s == "" {
 		return 0, false
+	}
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		s = s[1 : len(s)-1]
 	}
 	clean := strings.ReplaceAll(s, ",", "")
 	v, err := strconv.ParseFloat(clean, 64)
