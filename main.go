@@ -113,7 +113,7 @@ func parseCASHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeTransactions(account string, txns parseResponse) error {
-	data, err := json.Marshal(txns)
+	data, err := json.MarshalIndent(txns, "", "  ")
 	if err != nil {
 		return err
 	}
